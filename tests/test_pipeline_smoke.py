@@ -133,13 +133,49 @@ def test_fake_video_extraction(tmp_path: Path) -> None:
 
     assert len(raw) == 6
     assert metadata["pose_detection_rate"] == 1.0
+    assert metadata["analysis_backend"] == "mediapipe_tasks"
     assert annotated and Path(annotated).exists()
 
+
+
+def test_opencv_fallback_video_extraction(tmp_path: Path) -> None:
+    video_path = tmp_path / "moving_swimmer_proxy.mp4"
+    writer = cv2.VideoWriter(
+        str(video_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        24.0,
+        (360, 200),
+    )
+    assert writer.isOpened()
+    for index in range(36):
+        frame = np.zeros((200, 360, 3), dtype=np.uint8)
+        x = 30 + index * 5
+        cv2.ellipse(frame, (x + 45, 100), (45, 16), 0, 0, 360, (220, 220, 220), -1)
+        cv2.circle(frame, (x + 2, 100), 12, (220, 220, 220), -1)
+        cv2.line(frame, (x + 55, 92), (x + 92, 72), (220, 220, 220), 8)
+        cv2.line(frame, (x + 55, 108), (x + 92, 128), (220, 220, 220), 8)
+        writer.write(frame)
+    writer.release()
+
+    raw, annotated, metadata = pipeline.extract_pose_timeseries(
+        video_path,
+        output_dir=tmp_path / "fallback_outputs",
+        max_frames=24,
+        stride=1,
+        resize_width=360,
+        backend="opencv_motion",
+    )
+    assert len(raw) == 24
+    assert metadata["analysis_backend"] == "opencv_motion_fallback"
+    assert metadata["backend_warning"]
+    assert raw["pose_detected"].sum() > 0
+    assert annotated and Path(annotated).exists()
 
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="swim_coach_test_") as temporary:
         work_dir = Path(temporary)
         test_fake_video_extraction(work_dir)
+        test_opencv_fallback_video_extraction(work_dir)
 
         raw = synthetic_landmark_frame()
         features = pipeline.add_kinematic_features(raw)

@@ -1,0 +1,4 @@
+# Optional local/Colab extensions. They are intentionally excluded from the
+# default Streamlit Community Cloud build to reduce installation time and RAM.
+xgboost>=3.1
+lightgbm>=4.6

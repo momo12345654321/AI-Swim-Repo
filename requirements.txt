@@ -1,18 +1,16 @@
-# Streamlit Community Cloud - Python 3.12
-streamlit==1.59.2
+--only-binary=:all:
 
-# MediaPipe currently declares the desktop OpenCV package. This local metadata
-# shim redirects that dependency to the headless contrib wheel, avoiding libGL
-# and libglib apt conflicts on Community Cloud.
-./vendor/opencv_contrib_python-4.11.0.86-py3-none-any.whl
-mediapipe==0.10.35
+# Python 3.14 Streamlit Community Cloud build.
+streamlit==1.64.0
 
-# Bundled FFmpeg executable; no Debian ffmpeg package is required.
+# Metadata shim: satisfies MediaPipe's opencv-contrib-python dependency while
+# installing the headless contrib wheel that is appropriate for cloud servers.
+./vendor/opencv_contrib_python-4.14.0.94-py3-none-any.whl
+mediapipe==1.0.1
+
+# Video, time-series, and cloud-friendly machine learning.
 imageio-ffmpeg==0.6.0
-
-numpy==1.26.4
-pandas==2.2.3
-scikit-learn>=1.6,<1.9
-joblib>=1.4,<2
-xgboost>=2.1,<4
-lightgbm>=4.5,<5
+numpy==2.5.3
+pandas==3.0.6
+scikit-learn==1.9.1
+joblib==1.5.3

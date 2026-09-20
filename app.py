@@ -7,14 +7,35 @@ Advisor: Dr. Qingyang Xiao
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
+import importlib.util
 import json
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-import pandas as pd
 import streamlit as st
+
+APP_TITLE = "AI Swimming Coach"
+APP_SUBTITLE = "Video pose analysis, time-series features, coaching insights, and trainable AI baselines"
+AUTHOR_NAME = "Jasper Ding"
+ADVISOR_NAME = "Dr. Qingyang Xiao"
+SUPPORTED_EXTENSIONS = ["mp4", "mov", "m4v", "avi", "mkv", "wmv"]
+SUPPORTED_PYTHON_LABEL = "Python 3.12-3.14"
+
+st.set_page_config(
+    page_title=APP_TITLE,
+    page_icon="SW",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# The cloud build now supports the active Python 3.14 runtime. MediaPipe is
+# loaded lazily by the analysis pipeline, with an OpenCV fallback if the
+# pose engine or its model is unavailable.
+import pandas as pd
 
 from ai_pipeline import (
     DEFAULT_FEATURE_COLUMNS,
@@ -29,19 +50,6 @@ from ai_pipeline import (
     save_outputs,
     summarize_video,
     train_supervised_models,
-)
-
-APP_TITLE = "AI Swimming Coach"
-APP_SUBTITLE = "Video pose analysis, time-series features, coaching insights, and trainable AI baselines"
-AUTHOR_NAME = "Jasper Ding"
-ADVISOR_NAME = "Dr. Qingyang Xiao"
-SUPPORTED_EXTENSIONS = ["mp4", "mov", "m4v", "avi", "mkv", "wmv"]
-
-st.set_page_config(
-    page_title=APP_TITLE,
-    page_icon="SW",
-    layout="wide",
-    initial_sidebar_state="expanded",
 )
 
 st.markdown(
@@ -178,6 +186,25 @@ with st.sidebar:
     st.markdown(f"**Author:** {AUTHOR_NAME}  \n**Advisor:** {ADVISOR_NAME}")
     st.divider()
     st.header("Analysis settings")
+    engine_label = st.selectbox(
+        "Analysis engine",
+        options=[
+            "Automatic: MediaPipe, then OpenCV fallback",
+            "MediaPipe Pose Landmarker only",
+            "OpenCV motion fallback only",
+        ],
+        index=0,
+        help=(
+            "Automatic is recommended. It uses anatomical MediaPipe landmarks when "
+            "available and keeps the app operational with a clearly labelled motion proxy otherwise."
+        ),
+    )
+    backend_by_label = {
+        "Automatic: MediaPipe, then OpenCV fallback": "auto",
+        "MediaPipe Pose Landmarker only": "mediapipe",
+        "OpenCV motion fallback only": "opencv_motion",
+    }
+    selected_backend = backend_by_label[engine_label]
     max_frames = st.slider(
         "Maximum processed frames",
         min_value=90,
@@ -215,19 +242,54 @@ with st.sidebar:
     st.divider()
     st.caption("Recommended input: a 5-20 second clip with the full swimmer visible. H.264 MP4 is the most reliable format.")
     with st.expander("Deployment diagnostics"):
-        try:
-            import cv2
-            import mediapipe as mp
-            import imageio_ffmpeg
+        def installed_version(distribution: str) -> str:
+            try:
+                return importlib.metadata.version(distribution)
+            except importlib.metadata.PackageNotFoundError:
+                return "Not installed"
 
-            st.write({
-                "OpenCV": cv2.__version__,
-                "MediaPipe": mp.__version__,
-                "Bundled FFmpeg": get_ffmpeg_executable() or "Unavailable",
-                "imageio-ffmpeg": getattr(imageio_ffmpeg, "__version__", "unknown"),
-            })
-        except Exception as diagnostic_error:
-            st.warning(f"Dependency diagnostic failed: {diagnostic_error}")
+        st.write(
+            {
+                "Python": sys.version.split()[0],
+                "Supported runtime": SUPPORTED_PYTHON_LABEL,
+                "Streamlit": installed_version("streamlit"),
+                "MediaPipe": installed_version("mediapipe"),
+                "OpenCV headless": installed_version("opencv-contrib-python-headless"),
+                "XGBoost installed": importlib.util.find_spec("xgboost") is not None,
+                "LightGBM installed": importlib.util.find_spec("lightgbm") is not None,
+            }
+        )
+        if st.button(
+            "Run computer-vision dependency check",
+            key="run_dependency_diagnostics",
+            use_container_width=True,
+        ):
+            try:
+                import cv2
+                import imageio_ffmpeg
+
+                results = {
+                    "OpenCV": cv2.__version__,
+                    "Bundled FFmpeg": get_ffmpeg_executable() or "Unavailable",
+                    "imageio-ffmpeg": getattr(imageio_ffmpeg, "__version__", "unknown"),
+                    "OpenCV fallback": "Ready",
+                }
+                try:
+                    from mediapipe.tasks.python.vision import pose_landmarker as _pose_probe
+
+                    results["MediaPipe Tasks"] = (
+                        "Ready" if hasattr(_pose_probe, "PoseLandmarker") else "Incomplete"
+                    )
+                    st.success("Computer-vision dependencies are ready.")
+                except Exception as mediapipe_error:
+                    results["MediaPipe Tasks"] = f"Unavailable: {mediapipe_error}"
+                    st.warning(
+                        "MediaPipe is unavailable, but the OpenCV motion fallback is ready, "
+                        "so video analysis can still run."
+                    )
+                st.write(results)
+            except Exception as diagnostic_error:
+                st.error(f"Core dependency diagnostic failed: {diagnostic_error}")
     if st.session_state.analysis is not None:
         if st.button("Clear current analysis", use_container_width=True):
             _reset_analysis()
@@ -290,6 +352,7 @@ if uploaded_file is not None:
                 min_tracking_confidence=tracking_confidence,
                 create_annotated_video=True,
                 progress_callback=progress_callback,
+                backend=selected_backend,
             )
             feature_df = add_kinematic_features(raw_df)
             metrics = summarize_video(feature_df, metadata)
@@ -318,7 +381,13 @@ if uploaded_file is not None:
             st.session_state.upload_fingerprint = current_fingerprint
             st.session_state.training = None
             st.session_state.feedback = None
-            st.success("The video was processed successfully.")
+            if metadata.get("analysis_backend") == "opencv_motion_fallback":
+                st.warning(
+                    "Analysis completed with the OpenCV motion fallback. The generated "
+                    "landmarks and joint-angle metrics are proxies, not anatomical detections."
+                )
+            else:
+                st.success("The video was processed successfully with MediaPipe pose landmarks.")
             st.rerun()
         except Exception as exc:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -333,10 +402,10 @@ analysis: Optional[Dict[str, Any]] = st.session_state.analysis
 if analysis is None:
     st.markdown("### What this prototype produces")
     feature_columns = [
-        ("Annotated video", "Pose landmarks and body connections overlaid on the uploaded clip."),
+        ("Annotated video", "MediaPipe pose landmarks when available, with a clearly labelled OpenCV motion-proxy fallback."),
         ("Time-series data", "Frame-level landmarks, joint angles, movement speeds, symmetry gaps, and alignment features."),
         ("Coaching insights", "Transparent rule-based evidence, suggestions, and training drills."),
-        ("Trainable AI", "Random Forest, Gradient Boosting, XGBoost, LightGBM, and a Conv1D plus BiLSTM design."),
+        ("Trainable AI", "Cloud-ready Logistic Regression, Random Forest, and Gradient Boosting; optional XGBoost, LightGBM, and Conv1D plus BiLSTM extensions."),
         ("Feedback learning", "A coach/user rating loop that updates recommendation priorities."),
     ]
     for left, right in feature_columns:
@@ -348,6 +417,17 @@ feature_df: pd.DataFrame = analysis["feature_df"]
 raw_df: pd.DataFrame = analysis["raw_df"]
 recommendations = analysis["recommendations"]
 saved_paths = analysis["saved_paths"]
+analysis_backend = str(metrics.get("analysis_backend") or "unknown")
+analysis_backend_label = str(metrics.get("analysis_backend_label") or analysis_backend)
+if analysis_backend == "opencv_motion_fallback":
+    st.warning(
+        "This result used the OpenCV motion/silhouette fallback. It estimates proxy "
+        "landmarks so the cloud app remains usable, but joint angles and coaching "
+        "measurements are approximate. Confirm important decisions with MediaPipe "
+        "or a qualified swimming coach."
+    )
+else:
+    st.caption(f"Analysis engine: {analysis_backend_label}")
 
 overview_tab, video_tab, data_tab, ml_tab, deep_tab, feedback_tab, about_tab = st.tabs(
     [
@@ -365,7 +445,10 @@ with overview_tab:
     st.subheader("Analysis summary")
     metric_columns = st.columns(5)
     metric_columns[0].metric("Processed frames", int(metrics.get("processed_frames", 0)))
-    metric_columns[1].metric("Pose detection", f"{float(metrics.get('pose_detection_rate', 0.0)):.0%}")
+    metric_columns[1].metric(
+        "Pose detection" if analysis_backend == "mediapipe_tasks" else "Motion proxy detection",
+        f"{float(metrics.get('pose_detection_rate', 0.0)):.0%}",
+    )
     metric_columns[2].metric(
         "Analyzed duration",
         _format_optional(metrics.get("analyzed_duration_sec"), 1, " s"),
@@ -394,7 +477,11 @@ with overview_tab:
     )
 
 with video_tab:
-    st.subheader("Pose-annotated video")
+    st.subheader(
+        "Pose-annotated video"
+        if analysis_backend == "mediapipe_tasks"
+        else "Motion-proxy annotated video"
+    )
     annotated_path = analysis.get("annotated_path")
     if annotated_path and Path(annotated_path).exists():
         st.video(annotated_path)
@@ -471,11 +558,21 @@ with ml_tab:
     with labels_col:
         n_labels = st.slider("Number of demo patterns", 2, 5, 3)
     with booster_col:
-        include_boosters = st.checkbox(
-            "Include XGBoost and LightGBM",
-            value=True,
-            help="These models take longer to train than the scikit-learn baselines.",
+        boosters_available = (
+            importlib.util.find_spec("xgboost") is not None
+            and importlib.util.find_spec("lightgbm") is not None
         )
+        include_boosters = st.checkbox(
+            "Include optional XGBoost and LightGBM",
+            value=False,
+            disabled=not boosters_available,
+            help=(
+                "These optional packages are intentionally excluded from the fast Community Cloud build. "
+                "Install requirements-optional-boosters.txt locally or in Colab to enable them."
+            ),
+        )
+        if not boosters_available:
+            st.caption("Cloud-fast mode: Logistic Regression, Random Forest, and Gradient Boosting are enabled.")
 
     if st.button("Train supervised models", type="primary", use_container_width=True):
         try:
@@ -673,16 +770,17 @@ with about_tab:
     st.subheader("Prototype architecture")
     st.markdown(
         "1. **Input:** uploaded swimming video.\n"
-        "2. **Computer vision:** MediaPipe Pose Landmarker extracts 33 body landmarks.\n"
+        "2. **Computer vision:** Automatic mode uses MediaPipe Pose Landmarker for 33 anatomical landmarks and falls back to clearly labelled OpenCV motion/silhouette proxy landmarks when necessary.\n"
         "3. **Feature engineering:** joint angles, body alignment, speed, kick amplitude, and symmetry time series.\n"
         "4. **Recommendation engine:** transparent rules generate evidence, suggestions, and drills.\n"
-        "5. **Supervised learning:** Logistic Regression, Random Forest, Gradient Boosting, XGBoost, and LightGBM baselines.\n"
+        "5. **Supervised learning:** Logistic Regression, Random Forest, and Gradient Boosting run in the cloud build; XGBoost and LightGBM remain optional.\n"
         "6. **Deep learning:** optional Conv1D plus BiLSTM model in Colab.\n"
         "7. **Feedback learning:** ratings update action priorities through a reward-ranking demonstration."
     )
     st.markdown("**Limitations**")
     st.markdown(
         "- Underwater refraction and occlusion can reduce landmark accuracy.\n"
+        "- OpenCV fallback points are motion/silhouette proxies, not anatomical detections.\n"
         "- Camera-plane angles are not full biomechanical measurements.\n"
         "- Demo labels are unsupervised clusters, not coach ground truth.\n"
         "- Real validation requires diverse, consented, coach-labeled swimming videos."

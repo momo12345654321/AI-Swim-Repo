@@ -18,6 +18,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -82,6 +83,11 @@ FEEDBACK_ACTIONS: List[Dict[str, str]] = [
         "title": "Improve recording quality",
         "drill": "Record a side view with the full body visible and minimal glare.",
     },
+    {
+        "action_id": "confirm_with_pose_model",
+        "title": "Confirm proxy findings with anatomical pose landmarks",
+        "drill": "Re-record a short side-view clip and run the MediaPipe engine when available.",
+    },
 ]
 
 POSE_CONNECTIONS: Tuple[Tuple[int, int], ...] = (
@@ -97,6 +103,8 @@ POSE_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
     "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
 )
+
+SUPPORTED_ANALYSIS_BACKENDS: Tuple[str, ...] = ("auto", "mediapipe", "opencv_motion")
 
 ProgressCallback = Callable[[float, str], None]
 
@@ -152,21 +160,279 @@ def _create_pose_landmarker(
     min_detection_confidence: float,
     min_tracking_confidence: float,
 ):
-    import mediapipe as mp
-    from mediapipe.tasks import python
-    from mediapipe.tasks.python import vision
+    """Create the current MediaPipe Tasks pose engine.
+
+    Direct module imports are used instead of ``mp.solutions`` and top-level
+    aliases so the code works with the MediaPipe 1.x package layout. The
+    returned image module exposes ``Image`` and ``ImageFormat``.
+    """
+    from mediapipe.tasks.python.core import base_options as base_options_lib
+    from mediapipe.tasks.python.vision import pose_landmarker as pose_landmarker_lib
+    from mediapipe.tasks.python.vision.core import image as image_lib
+    from mediapipe.tasks.python.vision.core import vision_task_running_mode as running_mode_lib
 
     model = ensure_pose_model(model_path)
-    options = vision.PoseLandmarkerOptions(
-        base_options=python.BaseOptions(model_asset_path=str(model)),
-        running_mode=vision.RunningMode.VIDEO,
+    options = pose_landmarker_lib.PoseLandmarkerOptions(
+        base_options=base_options_lib.BaseOptions(model_asset_path=str(model)),
+        running_mode=running_mode_lib.VisionTaskRunningMode.VIDEO,
         num_poses=1,
         min_pose_detection_confidence=float(min_detection_confidence),
         min_pose_presence_confidence=float(min_detection_confidence),
         min_tracking_confidence=float(min_tracking_confidence),
     )
-    return mp, vision.PoseLandmarker.create_from_options(options)
+    pose = pose_landmarker_lib.PoseLandmarker.create_from_options(options)
+    return image_lib, pose
 
+class _OpenCVMotionPoseBackend:
+    """Best-effort motion/silhouette fallback for cloud runtimes.
+
+    This backend deliberately labels its output as proxy landmarks. It keeps
+    the app usable if MediaPipe cannot import, initialize, or download its
+    model, but its points are not anatomical detections and must not be used
+    for injury or medical decisions.
+    """
+
+    _TEMPLATE: Tuple[Tuple[float, float, float], ...] = (
+        (0.03, 0.00, 0.25),
+        (0.03, -0.15, 0.30), (0.03, -0.25, 0.32), (0.04, -0.35, 0.34),
+        (0.03, 0.15, 0.30), (0.03, 0.25, 0.32), (0.04, 0.35, 0.34),
+        (0.07, -0.60, 0.46), (0.07, 0.60, 0.46),
+        (0.075, -0.25, 0.35), (0.075, 0.25, 0.35),
+        (0.22, -0.60, 0.90), (0.22, 0.60, 0.90),
+        (0.36, -0.85, 1.00), (0.36, 0.85, 1.00),
+        (0.50, -1.00, 1.08), (0.50, 1.00, 1.08),
+        (0.54, -1.10, 1.08), (0.54, 1.10, 1.08),
+        (0.55, -0.95, 1.08), (0.55, 0.95, 1.08),
+        (0.52, -0.74, 1.03), (0.52, 0.74, 1.03),
+        (0.56, -0.35, 0.76), (0.56, 0.35, 0.76),
+        (0.75, -0.20, 0.62), (0.75, 0.20, 0.62),
+        (0.91, -0.15, 0.52), (0.91, 0.15, 0.52),
+        (0.95, -0.10, 0.48), (0.95, 0.10, 0.48),
+        (0.99, -0.22, 0.52), (0.99, 0.22, 0.52),
+    )
+
+    def __init__(self) -> None:
+        cv2 = _safe_import_cv2()
+        self.cv2 = cv2
+        self.subtractor = cv2.createBackgroundSubtractorMOG2(
+            history=180,
+            varThreshold=24,
+            detectShadows=False,
+        )
+        self.previous_gray: Optional[np.ndarray] = None
+        self.previous_centroid: Optional[np.ndarray] = None
+        self.previous_axis: Optional[np.ndarray] = None
+        self.previous_landmarks: Optional[List[Any]] = None
+
+    def close(self) -> None:
+        return None
+
+    def _motion_mask(self, frame: np.ndarray) -> np.ndarray:
+        cv2 = self.cv2
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        foreground = self.subtractor.apply(frame)
+        _, foreground = cv2.threshold(foreground, 180, 255, cv2.THRESH_BINARY)
+
+        if self.previous_gray is None:
+            difference = np.zeros_like(gray)
+        else:
+            difference = cv2.absdiff(gray, self.previous_gray)
+            difference = cv2.GaussianBlur(difference, (5, 5), 0)
+            _, difference = cv2.threshold(difference, 16, 255, cv2.THRESH_BINARY)
+        self.previous_gray = gray
+
+        mask = cv2.bitwise_or(foreground, difference)
+        scale = max(min(frame.shape[:2]) // 160, 2)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * scale + 1, 2 * scale + 1))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask = cv2.dilate(mask, kernel, iterations=1)
+        return mask
+
+    def _select_contour(self, frame: np.ndarray, mask: np.ndarray) -> Optional[np.ndarray]:
+        cv2 = self.cv2
+        frame_area = float(frame.shape[0] * frame.shape[1])
+
+        def candidates(binary: np.ndarray) -> List[np.ndarray]:
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            usable: List[np.ndarray] = []
+            for contour in contours:
+                area = float(cv2.contourArea(contour))
+                if 0.0015 * frame_area <= area <= 0.78 * frame_area:
+                    usable.append(contour)
+            return usable
+
+        usable = candidates(mask)
+        if not usable:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gray, 45, 135)
+            edge_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+            edges = cv2.dilate(edges, edge_kernel, iterations=2)
+            edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, edge_kernel, iterations=2)
+            usable = candidates(edges)
+        if not usable:
+            return None
+
+        def score(contour: np.ndarray) -> float:
+            area = float(cv2.contourArea(contour))
+            _, _, width, height = cv2.boundingRect(contour)
+            elongation = max(width, height) / max(min(width, height), 1)
+            return area * (1.0 + min(elongation, 8.0) * 0.08)
+
+        return max(usable, key=score)
+
+    def _contour_to_landmarks(
+        self,
+        frame: np.ndarray,
+        contour: np.ndarray,
+    ) -> Tuple[List[Any], List[Any], Dict[str, Any]]:
+        cv2 = self.cv2
+        height, width = frame.shape[:2]
+        points = contour.reshape(-1, 2).astype(float)
+        moments = cv2.moments(contour)
+        if abs(float(moments.get("m00", 0.0))) > 1e-9:
+            centroid = np.asarray(
+                [moments["m10"] / moments["m00"], moments["m01"] / moments["m00"]],
+                dtype=float,
+            )
+        else:
+            centroid = points.mean(axis=0)
+
+        centered = points - centroid
+        covariance = np.cov(centered, rowvar=False) if len(points) >= 3 else np.eye(2)
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        axis = np.asarray(eigenvectors[:, int(np.argmax(eigenvalues))], dtype=float)
+        axis /= max(float(np.linalg.norm(axis)), 1e-9)
+
+        motion = None
+        if self.previous_centroid is not None:
+            motion = centroid - self.previous_centroid
+        if self.previous_axis is not None and float(np.dot(axis, self.previous_axis)) < 0.0:
+            axis = -axis
+        if motion is not None and float(np.linalg.norm(motion)) >= 2.0:
+            # The leading end is treated as the head, so the body axis points
+            # opposite the direction of travel (head -> feet).
+            if float(np.dot(axis, motion)) > 0.0:
+                axis = -axis
+        elif self.previous_axis is None:
+            if abs(float(axis[0])) >= abs(float(axis[1])):
+                if axis[0] > 0.0:
+                    axis = -axis
+            elif axis[1] > 0.0:
+                axis = -axis
+
+        normal = np.asarray([-axis[1], axis[0]], dtype=float)
+        longitudinal = centered @ axis
+        lateral = centered @ normal
+        low = float(np.quantile(longitudinal, 0.01))
+        high = float(np.quantile(longitudinal, 0.99))
+        span = max(high - low, 12.0)
+        contour_area = max(float(cv2.contourArea(contour)), 1.0)
+        hull_area = max(float(cv2.contourArea(cv2.convexHull(contour))), contour_area)
+        solidity = float(np.clip(contour_area / hull_area, 0.0, 1.0))
+        area_ratio = contour_area / max(float(width * height), 1.0)
+        confidence = float(np.clip(0.30 + 4.0 * area_ratio + 0.25 * solidity, 0.34, 0.82))
+        default_half_width = max(math.sqrt(contour_area) / 8.0, span * 0.025, 3.0)
+        band = max(span * 0.055, 5.0)
+
+        landmarks: List[Any] = []
+        world_landmarks: List[Any] = []
+        for index, (fraction, side, width_scale) in enumerate(self._TEMPLATE):
+            target = low + float(fraction) * span
+            local = lateral[np.abs(longitudinal - target) <= band]
+            if len(local) >= 4:
+                q10, q90 = np.quantile(local, [0.10, 0.90])
+                local_center = float((q10 + q90) / 2.0)
+                local_half_width = max(float((q90 - q10) / 2.0), 2.0)
+            else:
+                local_center = 0.0
+                local_half_width = default_half_width
+
+            pixel = centroid + axis * target + normal * (
+                local_center + float(side) * local_half_width * float(width_scale)
+            )
+            x = float(np.clip(pixel[0] / max(width, 1), 0.0, 1.0))
+            y = float(np.clip(pixel[1] / max(height, 1), 0.0, 1.0))
+
+            if self.previous_landmarks is not None and index < len(self.previous_landmarks):
+                previous = self.previous_landmarks[index]
+                smoothing = 0.62
+                x = smoothing * x + (1.0 - smoothing) * float(previous.x)
+                y = smoothing * y + (1.0 - smoothing) * float(previous.y)
+
+            z = float(side) * 0.006
+            landmarks.append(SimpleNamespace(x=x, y=y, z=z, visibility=confidence))
+            world_landmarks.append(
+                SimpleNamespace(
+                    x=(x - 0.5) * 2.0,
+                    y=(y - 0.5) * 2.0,
+                    z=z,
+                    visibility=confidence,
+                )
+            )
+
+        self.previous_centroid = centroid
+        self.previous_axis = axis
+        self.previous_landmarks = landmarks
+        box = cv2.boxPoints(cv2.minAreaRect(contour)).astype(int)
+        debug = {
+            "contour": contour,
+            "box": box,
+            "centroid": tuple(int(round(value)) for value in centroid),
+            "axis": axis,
+            "confidence": confidence,
+        }
+        return landmarks, world_landmarks, debug
+
+    def detect(
+        self,
+        frame: np.ndarray,
+        timestamp_ms: int,
+    ) -> Tuple[Optional[List[Any]], Optional[List[Any]], Dict[str, Any]]:
+        del timestamp_ms
+        mask = self._motion_mask(frame)
+        contour = self._select_contour(frame, mask)
+        if contour is None:
+            return None, None, {"mask": mask}
+        landmarks, world_landmarks, debug = self._contour_to_landmarks(frame, contour)
+        debug["mask"] = mask
+        return landmarks, world_landmarks, debug
+
+    def annotate(
+        self,
+        frame: np.ndarray,
+        landmarks: Optional[List[Any]],
+        debug: Dict[str, Any],
+    ) -> None:
+        cv2 = self.cv2
+        contour = debug.get("contour")
+        box = debug.get("box")
+        if contour is not None:
+            cv2.drawContours(frame, [contour], -1, (55, 200, 80), 2, cv2.LINE_AA)
+        if box is not None:
+            cv2.polylines(frame, [np.asarray(box, dtype=int)], True, (255, 180, 0), 2, cv2.LINE_AA)
+        if landmarks is not None:
+            _draw_landmarks(frame, landmarks)
+        cv2.putText(
+            frame,
+            "OpenCV motion fallback - proxy landmarks",
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (20, 20, 20),
+            4,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            "OpenCV motion fallback - proxy landmarks",
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
 
 def _clip_resize(frame: np.ndarray, resize_width: Optional[int]) -> np.ndarray:
     if not resize_width or resize_width <= 0:
@@ -344,11 +610,14 @@ def extract_pose_timeseries(
     create_annotated_video: bool = True,
     model_path: str | Path | None = None,
     progress_callback: Optional[ProgressCallback] = None,
+    backend: str = "auto",
 ) -> Tuple[pd.DataFrame, Optional[str], Dict[str, Any]]:
-    """Extract MediaPipe pose landmarks and create an annotated video.
+    """Extract pose or motion-proxy landmarks and create an annotated video.
 
-    ``max_frames`` means the maximum number of processed frames after applying
-    ``stride``. The callback receives a value in [0, 1] and a status message.
+    ``backend='auto'`` first attempts the MediaPipe Tasks Pose Landmarker. If
+    MediaPipe is unavailable, cannot initialize on the active Python runtime,
+    or cannot retrieve its model, the function automatically uses an OpenCV
+    motion/silhouette proxy so the Streamlit app remains operational.
     """
     del model_complexity
     cv2 = _safe_import_cv2()
@@ -358,6 +627,21 @@ def extract_pose_timeseries(
         raise ValueError("stride must be at least 1")
     if max_frames < 1:
         raise ValueError("max_frames must be at least 1")
+
+    backend_key = str(backend or "auto").strip().lower().replace("-", "_")
+    aliases = {
+        "automatic": "auto",
+        "pose": "mediapipe",
+        "mediapipe_tasks": "mediapipe",
+        "opencv": "opencv_motion",
+        "motion": "opencv_motion",
+        "opencv_fallback": "opencv_motion",
+    }
+    backend_key = aliases.get(backend_key, backend_key)
+    if backend_key not in SUPPORTED_ANALYSIS_BACKENDS:
+        raise ValueError(
+            f"Unsupported backend '{backend}'. Choose one of {SUPPORTED_ANALYSIS_BACKENDS}."
+        )
 
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
@@ -385,15 +669,49 @@ def extract_pose_timeseries(
     raw_frame_index = 0
 
     if model_path is None:
-        model_path = Path.home() / ".cache" / "ai_swim_coach" / "pose_landmarker_lite.task"
+        bundled_model = Path(__file__).with_name("models") / "pose_landmarker_lite.task"
+        model_path = (
+            bundled_model
+            if bundled_model.exists()
+            else Path.home() / ".cache" / "ai_swim_coach" / "pose_landmarker_lite.task"
+        )
 
-    if progress_callback:
-        progress_callback(0.02, "Preparing the pose model")
-    mp, pose = _create_pose_landmarker(
-        model_path,
-        min_detection_confidence,
-        min_tracking_confidence,
-    )
+    image_api = None
+    pose = None
+    motion_backend: Optional[_OpenCVMotionPoseBackend] = None
+    backend_error: Optional[str] = None
+    backend_used = ""
+    backend_label = ""
+
+    if backend_key in {"auto", "mediapipe"}:
+        if progress_callback:
+            progress_callback(0.02, "Preparing the MediaPipe pose engine")
+        try:
+            image_api, pose = _create_pose_landmarker(
+                model_path,
+                min_detection_confidence,
+                min_tracking_confidence,
+            )
+            backend_used = "mediapipe_tasks"
+            backend_label = "MediaPipe Tasks Pose Landmarker"
+        except Exception as exc:
+            backend_error = f"{type(exc).__name__}: {exc}"[:1200]
+            if backend_key == "mediapipe":
+                capture.release()
+                raise RuntimeError(
+                    "The MediaPipe-only engine could not start. Select Automatic or "
+                    f"OpenCV motion fallback. Details: {backend_error}"
+                ) from exc
+
+    if pose is None:
+        if progress_callback:
+            message = "Preparing the OpenCV motion fallback"
+            if backend_error:
+                message += " after MediaPipe was unavailable"
+            progress_callback(0.02, message)
+        motion_backend = _OpenCVMotionPoseBackend()
+        backend_used = "opencv_motion_fallback"
+        backend_label = "OpenCV motion/silhouette proxy"
 
     try:
         while len(rows) < max_frames:
@@ -407,17 +725,24 @@ def extract_pose_timeseries(
 
             frame = _clip_resize(frame, resize_width)
             height, width = frame.shape[:2]
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(
-                image_format=mp.ImageFormat.SRGB,
-                data=np.ascontiguousarray(rgb),
-            )
             timestamp_ms = int(round(current_index * 1000.0 / raw_fps))
-            result = pose.detect_for_video(mp_image, timestamp_ms)
-            landmarks = result.pose_landmarks[0] if result.pose_landmarks else None
-            world_landmarks = (
-                result.pose_world_landmarks[0] if result.pose_world_landmarks else None
-            )
+            debug: Dict[str, Any] = {}
+
+            if pose is not None and image_api is not None:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                task_image = image_api.Image(
+                    image_format=image_api.ImageFormat.SRGB,
+                    data=np.ascontiguousarray(rgb),
+                )
+                result = pose.detect_for_video(task_image, timestamp_ms)
+                landmarks = result.pose_landmarks[0] if result.pose_landmarks else None
+                world_landmarks = (
+                    result.pose_world_landmarks[0] if result.pose_world_landmarks else None
+                )
+            else:
+                assert motion_backend is not None
+                landmarks, world_landmarks, debug = motion_backend.detect(frame, timestamp_ms)
+
             rows.append(
                 _landmark_row(
                     landmarks,
@@ -443,15 +768,23 @@ def extract_pose_timeseries(
                         writer = None
                         raise RuntimeError("OpenCV could not create the annotated video.")
                 annotated_frame = frame.copy()
-                if landmarks is not None:
+                if motion_backend is not None:
+                    motion_backend.annotate(annotated_frame, landmarks, debug)
+                elif landmarks is not None:
                     _draw_landmarks(annotated_frame, landmarks)
                 writer.write(annotated_frame)
 
             if progress_callback and len(rows) % 5 == 0:
                 ratio = min(len(rows) / max(estimated_processed, 1), 1.0)
-                progress_callback(0.05 + 0.83 * ratio, f"Processing frame {len(rows)}")
+                progress_callback(
+                    0.05 + 0.83 * ratio,
+                    f"Processing frame {len(rows)} with {backend_label}",
+                )
     finally:
-        pose.close()
+        if pose is not None:
+            pose.close()
+        if motion_backend is not None:
+            motion_backend.close()
         capture.release()
         if writer is not None:
             writer.release()
@@ -482,11 +815,19 @@ def extract_pose_timeseries(
         "pose_detection_rate": float(pose_detected_frames / len(dataframe)),
         "stride": int(stride),
         "resize_width": int(resize_width),
+        "analysis_backend": backend_used,
+        "analysis_backend_label": backend_label,
+        "backend_warning": (
+            "MediaPipe could not start, so the app used OpenCV motion/silhouette "
+            "proxy landmarks. Joint angles and coaching metrics are approximate."
+            if backend_used == "opencv_motion_fallback"
+            else None
+        ),
+        "mediapipe_startup_error": backend_error,
     }
     if progress_callback:
         progress_callback(0.96, "Calculating time-series features")
     return dataframe, str(annotated_path) if annotated_path else None, metadata
-
 
 def _series_speed(out: pd.DataFrame, landmark: str) -> pd.Series:
     coordinate_columns = [f"{landmark}_x", f"{landmark}_y", f"{landmark}_z"]
@@ -644,8 +985,18 @@ def _confidence(metrics: Dict[str, Any], base: float = 0.82) -> float:
     detection = float(metrics.get("pose_detection_rate") or 0.0)
     visibility = metrics.get("mean_landmark_visibility")
     visibility_value = float(visibility) if visibility is not None else detection
-    return float(np.clip(base * (0.55 + 0.25 * detection + 0.20 * visibility_value), 0.25, 0.95))
-
+    backend_factor = (
+        0.68
+        if metrics.get("analysis_backend") == "opencv_motion_fallback"
+        else 1.0
+    )
+    return float(
+        np.clip(
+            base * backend_factor * (0.55 + 0.25 * detection + 0.20 * visibility_value),
+            0.20,
+            0.95,
+        )
+    )
 
 def generate_recommendations(metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
     recommendations: List[Dict[str, Any]] = []
@@ -670,6 +1021,17 @@ def generate_recommendations(metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "suggestion": suggestion,
                 "drill": drill,
             }
+        )
+
+    if metrics.get("analysis_backend") == "opencv_motion_fallback":
+        add(
+            "confirm_with_pose_model",
+            "Treat these measurements as motion proxies",
+            "high",
+            "The analysis used an OpenCV motion/silhouette fallback rather than anatomical pose detection.",
+            "Use the proxy output to review timing and movement regions, then confirm joint-angle decisions with MediaPipe or a qualified coach.",
+            "Record a clear 5-15 second side view and rerun with the Automatic or MediaPipe engine.",
+            0.74,
         )
 
     if detection_rate < 0.65:
@@ -863,7 +1225,7 @@ def train_supervised_models(
     output_dir: str | Path = "models",
     test_size: float = 0.30,
     seed: int = 42,
-    include_optional_boosters: bool = True,
+    include_optional_boosters: bool = False,
 ) -> Dict[str, Any]:
     from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
     from sklearn.impute import SimpleImputer
