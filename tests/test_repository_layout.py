@@ -32,8 +32,10 @@ def test_python_runtime_hints() -> None:
     assert (ROOT / "runtime.txt").read_text(encoding="utf-8").strip() == "python-3.14"
 
 
-def test_apt_package_list_is_empty() -> None:
-    assert (ROOT / "packages.txt").read_text(encoding="utf-8").strip() == ""
+def test_apt_packages() -> None:
+    raw = (ROOT / "packages.txt").read_bytes()
+    assert b"\r" not in raw
+    assert raw.decode().split() == ["libgomp1", "libgles2", "libegl1"]
 
 
 def test_cloud_requirements() -> None:
