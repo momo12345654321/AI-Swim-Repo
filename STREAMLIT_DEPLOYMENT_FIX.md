@@ -1,20 +1,9 @@
-# Streamlit Community Cloud Python 3.14 fix
+# Deployment notes
 
-## Reported symptom
+The user-provided `AI-Swim-Repo-main.zip` is the Python 3.14-compatible starting backend. The supplied Lovable `ai-swim-coach.zip` is a separate TanStack Start/React project. Streamlit Community Cloud does not run a TanStack Start application as its `app.py` module.
 
-The application opened a page stating that Python 3.14.7 was unsupported and required Python 3.12. That message came from an intentional runtime guard in the previous `app.py`; it was not a Streamlit platform error.
+The integrated repository provides an actual Python Streamlit UI port in `app.py` and `swim_ui.py` while retaining the Lovable React files in `lovable_ui_source/` (not loaded by Streamlit). There is no Node/npm install step in the Cloud app. `packages.txt` uses the same shared-library set from the provided Python 3.14 backend. Python video/ML libraries are defined by `requirements.txt`.
 
-## Changes in this repository
+The earlier Python 3.12-only guard is absent. Deployment's Python version is governed by the Community Cloud deployment configuration; this package retains Python 3.14 dependencies because the supplied backend was configured for that runtime.
 
-1. Removed the Python 3.12-only runtime guard.
-2. Updated the default dependency set to Python 3.14-compatible wheels.
-3. Updated MediaPipe from 0.10.35 to 1.0.1 and switched to direct MediaPipe Tasks module imports.
-4. Added a metadata-only OpenCV shim that installs `opencv-contrib-python-headless`, avoiding desktop GUI libraries on Community Cloud.
-5. Kept `packages.txt` empty to avoid the prior Debian/FFmpeg APT conflict.
-6. Added an automatic OpenCV motion/silhouette fallback when MediaPipe or its model cannot initialize.
-7. Added explicit engine diagnostics and result warnings so proxy landmarks cannot be confused with anatomical detections.
-8. Kept XGBoost, LightGBM, and TensorFlow outside the default cloud build.
-
-## Redeployment
-
-Push all files to the same GitHub branch and reboot the existing Streamlit app. The current Python 3.14 deployment can be reused.
+For first deployment and troubleshooting steps, see `DEPLOYMENT_CHECKLIST.md`. For the exact UI mapping, see `docs/LOVABLE_UI_INTEGRATION.md`.

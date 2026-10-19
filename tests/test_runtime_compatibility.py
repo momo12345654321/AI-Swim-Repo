@@ -13,7 +13,7 @@ def test_app_has_no_runtime_stop_guard() -> None:
     tree = ast.parse(source)
     assert "requires Python 3.12" not in source
     assert "Delete the current Community Cloud app" not in source
-    assert "SUPPORTED_PYTHON_LABEL" in source
+    assert "PROJECT_ROOT" in source
     assert any(
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)

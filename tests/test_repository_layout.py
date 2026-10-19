@@ -88,7 +88,7 @@ def test_credits_are_present() -> None:
 def main() -> None:
     test_required_files_exist()
     test_python_runtime_hints()
-    test_apt_package_list_is_empty()
+    test_apt_packages()
     test_cloud_requirements()
     test_headless_shim_metadata()
     test_optional_boosters_are_not_default()
