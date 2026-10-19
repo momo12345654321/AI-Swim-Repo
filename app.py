@@ -104,6 +104,15 @@ def clear_analysis() -> None:
     st.session_state.upload_fingerprint = None
     st.session_state.upload_revision += 1
 
+# Navigation callbacks run before widgets are instantiated so they may set the 'section' key that the navigation segmented control owns.
+def go_to_analyze() -> None:
+    st.session_state.section = 'Analyze'
+
+
+def start_new_analysis() -> None:
+    clear_analysis()
+    go_to_analyze()
+
 
 def fmt_number(value: Any, places: int = 1, suffix: str = '') -> str:
     try:
@@ -175,10 +184,7 @@ def render_sidebar() -> dict[str, Any]:
                 except Exception as exc:
                     st.warning(f'MediaPipe unavailable; try the OpenCV fallback. Details: {exc}')
         if st.session_state.analysis is not None:
-            if st.button('Start a new video analysis', use_container_width=True):
-                clear_analysis()
-                st.session_state.section = 'Analyze'
-                st.rerun()
+            st.button('Start a new video analysis', use_container_width=True, on_click=start_new_analysis)
     return {
         'backend': backend,
         'max_frames': max_frames,
@@ -390,9 +396,7 @@ def render_session_summary(analysis: dict[str, Any]) -> None:
 
 def route_to_analyze(message: str) -> None:
     html(f'<div class="swim-empty"><strong>No analyzed video yet</strong>{clean(message)}</div>')
-    if st.button('Go to Analyze →', type='primary'):
-        st.session_state.section = 'Analyze'
-        st.rerun()
+    st.button('Go to Analyze →', type='primary', on_click=go_to_analyze)
 
 
 def page_analyze(settings: dict[str, Any], analysis: dict[str, Any] | None) -> None:
