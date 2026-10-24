@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import altair as alt
 import streamlit as st
 
 from ai_pipeline import (
@@ -68,6 +69,7 @@ def init_state() -> None:
         'training': None,
         'feedback': None,
         'upload_revision': 0,
+        'chart_view': 0,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -110,6 +112,8 @@ def go_to_analyze() -> None:
 
 
 def start_new_analysis() -> None:
+    def reset_chart_view() -> None:
+        st.session_state.chart_view += 1
     clear_analysis()
     go_to_analyze()
 
@@ -350,14 +354,16 @@ def render_session_summary(analysis: dict[str, Any]) -> None:
         ('Processed frames', str(metrics.get('processed_frames', 0)), 'Frames analyzed'),
         ('Motion detection', fmt_number(100 * float(metrics.get('pose_detection_rate') or 0), 0, '%'), 'Fraction of frames detected'),
         ('Analyzed duration', fmt_number(metrics.get('analyzed_duration_sec'), 1, ' s'), 'Sampled footage duration'),
-        ('Head alignment', fmt_number(metrics.get('mean_head_alignment_score'), 0, '/100'), 'Camera-plane heuristic score'),
+        ('Head alignment', fmt_number(metrics.get('mean_head_alignment_score'), 0, '/100'), 'Camera-plane heuristic score (100 = nose level with shoulders, drops as the head lifts or sinks)'),
     ]
     for col, (title, value, desc) in zip(cards, values):
         with col:
             html(metric_html(title, value, desc))
     chart_col, coach_col = st.columns([1.12, .88], gap='large')
-    with chart_col:
+    with st.container(border=True):
+        title_col, reset_col = st.columns([4, 1], vertical_alignment='center')
         st.markdown('**Movement consistency**')
+        reset_col.button('Reset view', key='reset_chart_view', on_click=reset_chart_view, width='stretch')
         features = analysis['feature_df']
         candidates = ['head_alignment_score', 'body_line_deviation', 'elbow_angle_symmetry_gap']
         available = next((k for k in candidates if k in features and features[k].notna().any()), None)
@@ -367,14 +373,17 @@ def render_session_summary(analysis: dict[str, Any]) -> None:
             # These are time blocks, NOT stroke cycles. Avoid claiming cycle detection.
             block_id = pd.Series([min(block_count - 1, index * block_count // len(seq)) for index in range(len(seq))])
             points = pd.DataFrame({'block': block_id, 'value': seq.reset_index(drop=True)}).groupby('block')['value'].mean()
-            st.bar_chart(points.rename(available.replace('_', ' ').title()), height=260)
+            label = available.replace('_', ' ').title()
+            chart_data = pd.DataFrame({'Time block': points.index + 1, label: points.values})
+            chart = alt.Chart(chart_data).mark_bar(size=28, color='#0B7285').encode(x=alt.X('Time block:Q', scale=alt.Scale(domain=[0.5, block_count + 0.5]), axis=alt.Axis(labelAngle=0, tickMinStep=1, format='d')), y=alt.Y(f'{label}:Q'), tooltip=['Time block', alt.Tooltip(f'{label}:Q', format='.1f')],).properties(height=260).interactive()
+            st.altair_chart(chart, width='stretch', key=f'consistency_chart_{st.session_state.chart_view}')
             st.caption('Eight chronological time blocks; bars are not detected stroke cycles.')
         else:
             st.info('No usable feature time series was measured from this clip.')
     with coach_col:
         lead = recs[0] if recs else None
         if lead:
-            html(f'''<div class="swim-coach"><div class="kicker">✦ Coach’s focus</div>
+            html(f'''<div class="swim-coach"><div class="kicker">✦ Main Focus</div>
             <h3>{clean(lead['title'])}</h3><p>{clean(lead['suggestion'])}</p>
             <div class="drill">→ {clean(lead.get('drill', ''))}</div></div>''')
     st.markdown('**Coaching insights and training suggestions**')
