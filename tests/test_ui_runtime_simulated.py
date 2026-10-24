@@ -46,6 +46,8 @@ class FakeUI(ModuleType, AbstractContextManager):
     def dataframe(self, *args, **kwargs): pass
     def bar_chart(self, *args, **kwargs): pass
     def line_chart(self, *args, **kwargs): pass
+    def altair_chart(self, *args, **kwargs): pass
+    def container(self, *args, **kwargs): return self
     def video(self, *args, **kwargs): pass
     def metric(self, *args, **kwargs): pass
     def download_button(self, *args, **kwargs): return False
