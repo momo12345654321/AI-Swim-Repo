@@ -225,11 +225,12 @@ def analyze_video(uploaded: Any, settings: dict[str, Any]) -> None:
     input_path = work_dir / safe_filename(uploaded.name)
     output_dir = work_dir / 'outputs'
     input_path.write_bytes(uploaded_bytes)
-    progress = st.progress(0, text='Preparing your swimming video')
+    progress = st.progress(0, text='Analyzing Video')
     progress_message = st.empty()
+    progess_message.caption('Preparing your swimming video')
 
     def update_progress(amount: float, message: str) -> None:
-        progress.progress(min(100, max(0, round(100 * amount))), text=message)
+        progress.progress(min(100, max(0, round(100 * amount))), text='Analyzing Video')
         progress_message.caption(message)
 
     try:
