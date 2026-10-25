@@ -57,6 +57,39 @@ DEFAULT_FEATURE_COLUMNS: List[str] = [
     "mean_landmark_visibility",
 ]
 
+# Readable name and unit for every column shown to users.
+FEATURE_INFO: Dict[str, Tuple[str, str]] = {
+    "frame_index": ("Frame", ""),
+    "timestamp_sec": ("Time", "s"),
+    "pose_detected": ("Pose detected", "1 = yes"),
+    "left_elbow_angle": ("Left elbow angle", "°"),
+    "right_elbow_angle": ("Right elbow angle", "°"),
+    "left_shoulder_angle": ("Left shoulder angle", "°"),
+    "right_shoulder_angle": ("Right shoulder angle", "°"),
+    "left_hip_angle": ("Left hip angle", "°"),
+    "right_hip_angle": ("Right hip angle", "°"),
+    "left_knee_angle": ("Left knee angle", "°"),
+    "right_knee_angle": ("Right knee angle", "°"),
+    "body_line_angle": ("Body line angle", "°"),
+    "body_line_deviation": ("Body tilt from horizontal", "°"),
+    "head_alignment_score": ("Head alignment", "score 0–100"),
+    "kick_amplitude": ("Kick depth", "× torso length"),
+    "left_wrist_speed": ("Left wrist speed", "torso lengths/s"),
+    "right_wrist_speed": ("Right wrist speed", "torso lengths/s"),
+    "left_ankle_speed": ("Left ankle speed", "torso lengths/s"),
+    "right_ankle_speed": ("Right ankle speed", "torso lengths/s"),
+    "wrist_symmetry_gap": ("Left–right wrist speed gap", "torso lengths/s"),
+    "ankle_symmetry_gap": ("Left–right ankle speed gap", "torso lengths/s"),
+    "elbow_angle_symmetry_gap": ("Left–right elbow angle gap", "°"),
+    "knee_angle_symmetry_gap": ("Left–right knee angle gap", "°"),
+    "mean_landmark_visibility": ("Landmark visibility", "0–1"),
+}
+
+
+def feature_label(column: str) -> str:
+    name, unit = FEATURE_INFO.get(column, (column.replace("_", " ").capitalize(), ""))
+    return f"{name} ({unit})" if unit else name
+
 FEEDBACK_ACTIONS: List[Dict[str, str]] = [
     {
         "action_id": "streamline_body_line",
@@ -444,13 +477,25 @@ def _clip_resize(frame: np.ndarray, resize_width: Optional[int]) -> np.ndarray:
     new_height = int(round(height * resize_width / width))
     return cv2.resize(frame, (int(resize_width), new_height), interpolation=cv2.INTER_AREA)
 
+def _frame_size(row: pd.Series) -> Tuple[float, float]:
+    width = pd.to_numeric(row.get("frame_width", np.nan), errors="coerce")
+    height = pd.to_numeric(row.get("frame_height", np.nan), errors="coerce")
+    width = float(width) if pd.notna(width) and width > 0 else 1.0
+    height = float(height) if pd.notna(height) and height > 0 else 1.0
+    return width, height
+
 
 def _point_from_row(row: pd.Series, landmark: str, use_world: bool = False) -> np.ndarray:
     prefix = f"{landmark}_world" if use_world else landmark
-    return np.asarray(
+    point = np.asarray(
         [row.get(f"{prefix}_x", np.nan), row.get(f"{prefix}_y", np.nan), row.get(f"{prefix}_z", np.nan)],
         dtype=float,
     )
+    if use_world:
+        return point
+    # MediaPipe divides x by the frame width and y by the frame height convert back to pixels so angles are not stretched.
+    width, height = _frame_size(row)
+    return point * np.asarray([width, height, width])
 
 
 def angle_degrees(a: Sequence[float], b: Sequence[float], c: Sequence[float]) -> float:
@@ -830,14 +875,18 @@ def extract_pose_timeseries(
     return dataframe, str(annotated_path) if annotated_path else None, metadata
 
 def _series_speed(out: pd.DataFrame, landmark: str) -> pd.Series:
-    coordinate_columns = [f"{landmark}_x", f"{landmark}_y", f"{landmark}_z"]
-    if not all(column in out.columns for column in coordinate_columns):
+    coordinate_columns = [f"{landmark}_x", f"{landmark}_y"]
+    if (not all(column in out.columns for column in coordinate_columns) or not np.isfinite(torso_length_px) or torso_length_px <= 1e-6):
         return pd.Series(np.nan, index=out.index, dtype=float)
-    coordinates = out[coordinate_columns].apply(pd.to_numeric, errors="coerce")
+        
+    width = pd.to_numeric(out.get("frame_width", 1.0), errors="coerce")
+    height = pd.to_numeric(out.get("frame_height", 1.0), errors="coerce")
+    x_px = pd.to_numeric(out[coordinate_columns[0]], errors="coerce") * width
+    y_px = pd.to_numeric(out[coordinate_columns[1]], errors="coerce") * height
     time_values = pd.to_numeric(out["timestamp_sec"], errors="coerce")
-    delta_position = coordinates.diff()
     delta_time = time_values.diff().replace(0, np.nan)
-    return np.sqrt((delta_position ** 2).sum(axis=1)) / delta_time
+    distance_px = np.sqrt(x_px.diff() ** 2 + y_px.diff() ** 2)
+    return distance_px / delta_time / torso_length_px
 
 
 def add_kinematic_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -860,6 +909,7 @@ def add_kinematic_features(df: pd.DataFrame) -> pd.DataFrame:
     head_scores: List[float] = []
     kick_amplitudes: List[float] = []
     visibility_values: List[float] = []
+    torso_lengths: List[float] = []
 
     for _, row in out.iterrows():
         shoulder_mid = _midpoint(row, "left_shoulder", "right_shoulder")
@@ -880,6 +930,7 @@ def add_kinematic_features(df: pd.DataFrame) -> pd.DataFrame:
             torso_length = float("nan")
         body_angles.append(angle)
         body_deviations.append(deviation)
+        torso_lengths.append(torso_length)
 
         if (
             np.all(np.isfinite(nose))
@@ -916,9 +967,12 @@ def add_kinematic_features(df: pd.DataFrame) -> pd.DataFrame:
     out["head_alignment_score"] = head_scores
     out["kick_amplitude"] = kick_amplitudes
     out["mean_landmark_visibility"] = visibility_values
+    out["torso_length_px"] = torso_lengths
+
+    median_torso = float(np.nanmedian(torso_lengths)) if np.isfinite(torso_lengths).any() else float("nan")
 
     for landmark in ("left_wrist", "right_wrist", "left_ankle", "right_ankle"):
-        out[f"{landmark}_speed"] = _series_speed(out, landmark)
+        out[f"{landmark}_speed"] = _series_speed(out, landmark, median_torso)
 
     out["wrist_symmetry_gap"] = (
         out["left_wrist_speed"] - out["right_wrist_speed"]
@@ -972,6 +1026,29 @@ def summarize_video(df: pd.DataFrame, metadata: Dict[str, Any]) -> Dict[str, Any
     }
     for output_name, (column, statistic) in metric_map.items():
         metrics[output_name] = _finite_stat(df[column], statistic) if column in df else None
+
+        # Freestyle arms and legs move half a cycle apart, so left and right must be compared over the whole clip, never frame by frame.
+    def motion_range(column: str) -> Optional[float]:
+        if column not in df:
+            return None
+        values = pd.to_numeric(df[column], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+        return float(values.quantile(0.90) - values.quantile(0.10)) if len(values) >= 2 else None
+
+    def percent_gap(left: Optional[float], right: Optional[float]) -> Optional[float]:
+        if left is None or right is None or left + right <= 0:
+            return None
+        return float(abs(left - right) / ((left + right) / 2.0) * 100.0)
+
+    left_elbow_range = motion_range("left_elbow_angle")
+    right_elbow_range = motion_range("right_elbow_angle")
+    metrics["elbow_range_gap_deg"] = (
+        abs(left_elbow_range - right_elbow_range)
+        if left_elbow_range is not None and right_elbow_range is not None
+        else None
+    )
+    metrics["wrist_speed_gap_pct"] = percent_gap(
+        metrics["p90_left_wrist_speed"], metrics["p90_right_wrist_speed"])
+    metrics["ankle_speed_gap_pct"] = percent_gap(_finite_stat(df["left_ankle_speed"], "p90") if "left_ankle_speed" in df else None, _finite_stat(df["right_ankle_speed"], "p90") if "right_ankle_speed" in df else None,)
 
     valid_timestamps = pd.to_numeric(df.get("timestamp_sec"), errors="coerce").dropna()
     if len(valid_timestamps) >= 2:
@@ -1069,17 +1146,17 @@ def generate_recommendations(metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
             0.76,
         )
 
-    elbow_gap = metrics.get("median_elbow_angle_symmetry_gap_deg")
-    wrist_gap = metrics.get("median_wrist_symmetry_gap")
+    elbow_range_gap = metrics.get("elbow_range_gap_deg")
+    wrist_gap_pct = metrics.get("wrist_speed_gap_pct")
     if (
-        (elbow_gap is not None and elbow_gap > 24.0)
-        or (wrist_gap is not None and wrist_gap > 0.45)
+        (elbow_range_gap is not None and elbow_range_gap > 20.0)
+        or (wrist_gap_pct is not None and wrist_gap_pct > 25.0)
     ):
         evidence_parts = []
-        if elbow_gap is not None:
-            evidence_parts.append(f"elbow-angle gap {elbow_gap:.1f} degrees")
-        if wrist_gap is not None:
-            evidence_parts.append(f"wrist-speed gap {wrist_gap:.2f} body units/s")
+        if elbow_gap is not None and elbow_range_gap > 20.0::
+            evidence_parts.append(f"elbows' range of motion differs by {elbow_range_gap:.0f} degrees")
+        if wrist_gap is not None and wrist_gap_pct > 25.0:
+            evidence_parts.append(f"peak wrist speed differs by {wrist_gap_pct:.0f}% between arms")
         add(
             "left_right_symmetry",
             "Balance the left and right stroke pattern",
@@ -1091,21 +1168,21 @@ def generate_recommendations(metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
         )
 
     kick_amplitude = metrics.get("median_kick_amplitude")
-    ankle_gap = metrics.get("median_ankle_symmetry_gap")
+    ankle_gap_pct = metrics.get("ankle_speed_gap_pct")
     if (
         (kick_amplitude is not None and kick_amplitude > 0.70)
-        or (ankle_gap is not None and ankle_gap > 0.55)
+        or (ankle_gap_pct is not None and ankle_gap_pct > 25.0)
     ):
         evidence_parts = []
-        if kick_amplitude is not None:
-            evidence_parts.append(f"relative kick amplitude {kick_amplitude:.2f}")
-        if ankle_gap is not None:
-            evidence_parts.append(f"ankle-speed gap {ankle_gap:.2f}")
+        if kick_amplitude is not None and kick_amplitude > 0.70:
+            evidence_parts.append(f"median kick depth was {kick_amplitude:.2f} × torso length")
+        if ankle_gap_pct is not None and ankle_gap_pct > 25.0:
+            evidence_parts.append(f"peak ankle speed differs by {ankle_gap_pct:.0f}% between legs")
         add(
             "compact_kick",
             "Use a smaller, more even kick",
             "medium",
-            "Median " + " and ".join(evidence_parts) + ".",
+            "Over the whole clip, " + " and ".join(evidence_parts) + ".",
             "Initiate the kick from the hips and avoid excessive knee bend or scissoring.",
             "Vertical kick for 3 x 20 seconds, then easy streamline kicking.",
             0.70,
@@ -1509,12 +1586,14 @@ def append_feedback(
 def demo_contextual_bandit_update(
     feedback_df: pd.DataFrame,
     seed: int = 42,
+    actions: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Return a deterministic reward ranking from coach/user feedback.
 
     This is a transparent contextual-bandit demonstration, not an online RL
     production policy. A Bayesian-smoothed reward prevents one rating from
-    completely dominating the ranking.
+    completely dominating the ranking. Pass ``actions`` ,such as the clip's
+    recommendations, to rank only those; unrated actions get no score.
     """
     if feedback_df.empty:
         return {
@@ -1532,8 +1611,13 @@ def demo_contextual_bandit_update(
     global_mean = float(feedback["reward"].mean())
     action_priorities: Dict[str, float] = {}
     action_details: List[Dict[str, Any]] = []
-    action_catalog = {item["action_id"]: item for item in FEEDBACK_ACTIONS}
-    for action_id in sorted(set(action_catalog) | set(feedback["action_id"].astype(str))):
+    if actions is None:
+        action_catalog = {item["action_id"]: item for item in FEEDBACK_ACTIONS}
+        action_ids = sorted(set(action_catalog) | set(feedback["action_id"].astype(str)))
+    else:
+        action_catalog = {str(item["action_id"]): item for item in actions}
+        action_ids = list(action_catalog)
+    for action_id in action_ids:
         subset = feedback[feedback["action_id"].astype(str) == action_id]
         count = len(subset)
         posterior = (subset["reward"].sum() + 3.0 * global_mean) / (count + 3.0)
@@ -1548,12 +1632,13 @@ def demo_contextual_bandit_update(
             {
                 **catalog_item,
                 "feedback_count": count,
-                "estimated_reward": round(float(posterior), 3),
+                # An unrated action has no evidence of its own so it gets no score.
+                "estimated_reward": round(float(posterior), 3) if count else None,
                 "priority": round(priority, 3),
             }
         )
 
-    action_details.sort(key=lambda item: item["priority"], reverse=True)
+    action_details.sort(key=lambda item: (item["estimated_reward"] is not None, item["estimated_reward"] or 0.0, item["priority"]), reverse=True,)
     return {
         "status": "Feedback ranking updated.",
         "model_updated": True,
