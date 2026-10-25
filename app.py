@@ -112,10 +112,11 @@ def go_to_analyze() -> None:
 
 
 def start_new_analysis() -> None:
-    def reset_chart_view() -> None:
-        st.session_state.chart_view += 1
     clear_analysis()
     go_to_analyze()
+
+def reset_chart_view() -> None:
+    st.session_state.chart_view += 1
 
 
 def fmt_number(value: Any, places: int = 1, suffix: str = '') -> str:
