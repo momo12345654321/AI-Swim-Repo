@@ -35,7 +35,7 @@ from ai_pipeline import (
     make_sequence_windows,
     save_outputs,
     summarize_video,
-    train_supervised_models,
+    trn_supervised_models,
 )
 from swim_ui import LOVABLE_CSS, card_html, clean, metric_html, page_intro
 
@@ -49,7 +49,7 @@ SUPPORTED_EXTENSIONS = ['mp4', 'mov', 'm4v', 'avi', 'mkv', 'wmv']
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 st.set_page_config(
-    page_title='AI Swimming Coach | Jasper Ding',
+    page_title='IM Coach | Jasper Ding',
     page_icon='🏊',
     layout='wide',
     initial_sidebar_state='expanded',
