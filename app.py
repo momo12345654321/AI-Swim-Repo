@@ -35,7 +35,7 @@ from ai_pipeline import (
     make_sequence_windows,
     save_outputs,
     summarize_video,
-    trn_supervised_models,
+    train_supervised_models,
 )
 from swim_ui import LOVABLE_CSS, card_html, clean, metric_html, page_intro
 
