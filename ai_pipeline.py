@@ -874,7 +874,7 @@ def extract_pose_timeseries(
         progress_callback(0.96, "Calculating time-series features")
     return dataframe, str(annotated_path) if annotated_path else None, metadata
 
-def _series_speed(out: pd.DataFrame, landmark: str) -> pd.Series:
+def _series_speed(out: pd.DataFrame, landmark: str, torso_length_px: float) -> pd.Series:
     coordinate_columns = [f"{landmark}_x", f"{landmark}_y"]
     if (not all(column in out.columns for column in coordinate_columns) or not np.isfinite(torso_length_px) or torso_length_px <= 1e-6):
         return pd.Series(np.nan, index=out.index, dtype=float)
@@ -1153,9 +1153,9 @@ def generate_recommendations(metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
         or (wrist_gap_pct is not None and wrist_gap_pct > 25.0)
     ):
         evidence_parts = []
-        if elbow_gap is not None and elbow_range_gap > 20.0::
+        if elbow_range_gap is not None and elbow_range_gap > 20.0:
             evidence_parts.append(f"elbows' range of motion differs by {elbow_range_gap:.0f} degrees")
-        if wrist_gap is not None and wrist_gap_pct > 25.0:
+        if wrist_gap_pct is not None and wrist_gap_pct > 25.0:
             evidence_parts.append(f"peak wrist speed differs by {wrist_gap_pct:.0f}% between arms")
         add(
             "left_right_symmetry",
